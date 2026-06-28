@@ -25,7 +25,6 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 processed_messages = set()
-# { request_id: { "bytes": ..., "filename": ..., "is_video": bool } }
 file_store = {}
 
 IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
@@ -66,7 +65,6 @@ def add_watermark(img_bytes: bytes) -> bytes:
 
         m = max(12, img.width // 50)
 
-        # 3 مواقع قطرية: يسار فوق — وسط — يمين تحت
         positions = [
             (m,                                        img.height // 5  - text_h // 2),
             (img.width // 2 - text_w // 2,             img.height // 2  - text_h // 2),
@@ -82,7 +80,7 @@ def add_watermark(img_bytes: bytes) -> bytes:
         img.save(output, format="JPEG", quality=95)
         return output.getvalue()
     except Exception as e:
-        print(f"⚠️ فشل الواترمارك: {e}")
+        print(f"فشل الواترمارك: {e}")
         return img_bytes
 
 
@@ -101,7 +99,6 @@ async def add_video_watermark(video_bytes: bytes, ext: str) -> bytes:
         text = "© Depth Of School"
         fontfile_arg = f":fontfile={font_path}" if font_path else ""
 
-        # 3 مواقع قطرية: يسار فوق — وسط — يمين تحت
         base = "fontsize=w/22:fontcolor=white@0.85:shadowcolor=black@0.6:shadowx=2:shadowy=2"
         drawtext = (
             f"drawtext=text='{text}'{fontfile_arg}:{base}:x=20:y=h/5-text_h/2,"
@@ -125,7 +122,7 @@ async def add_video_watermark(video_bytes: bytes, ext: str) -> bytes:
         _, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            print(f"⚠️ ffmpeg error: {stderr.decode()[-500:]}")
+            print(f"ffmpeg error: {stderr.decode()[-500:]}")
             os.unlink(in_path)
             return video_bytes
 
@@ -134,11 +131,11 @@ async def add_video_watermark(video_bytes: bytes, ext: str) -> bytes:
 
         os.unlink(in_path)
         os.unlink(out_path)
-        print(f"✅ واترمارك الفيديو جاهز ({len(result)} bytes)")
+        print(f"واترمارك الفيديو جاهز ({len(result)} bytes)")
         return result
 
     except Exception as e:
-        print(f"⚠️ فشل واترمارك الفيديو: {e}")
+        print(f"فشل واترمارك الفيديو: {e}")
         return video_bytes
 
 
@@ -157,9 +154,9 @@ async def send_review(user_id: int, guild_id: int, room_name: str, extra_text: s
         review_channel = await bot.fetch_channel(REVIEW_CHANNEL_ID)
 
         if target_channel_id:
-            header = f"📋 **طلب إضافة لروم موجود**\n**الروم:** <#{target_channel_id}>"
+            header = f"**طلب اضافة لروم موجود**\n**الروم:** <#{target_channel_id}>"
         else:
-            header = f"📋 **طلب روم جديد**\n**اسم الروم:** {room_name}"
+            header = f"**طلب روم جديد**\n**اسم الروم:** {room_name}"
 
         if extra_text:
             header += f"\n**الكلام:** {extra_text}"
@@ -177,9 +174,9 @@ async def send_review(user_id: int, guild_id: int, room_name: str, extra_text: s
         preview_file = discord.File(io.BytesIO(raw_bytes), filename=orig_filename)
         await review_channel.send(content=header, file=preview_file, view=view)
 
-        print(f"✅ تم إرسال الطلب لقناة المراجعة [{request_id}]")
+        print(f"تم ارسال الطلب لقناة المراجعة [{request_id}]")
     except Exception as e:
-        print(f"❌ خطأ في إرسال للقناة: {e}")
+        print(f"خطا في ارسال للقناة: {e}")
 
 
 class ReviewView(discord.ui.View):
@@ -194,12 +191,12 @@ class ReviewView(discord.ui.View):
         self.request_id = request_id
 
         accept_btn = discord.ui.Button(
-            label="✅ قبول",
+            label="قبول",
             style=discord.ButtonStyle.success,
             custom_id=f"accept_{request_id}"
         )
         reject_btn = discord.ui.Button(
-            label="❌ رفض",
+            label="رفض",
             style=discord.ButtonStyle.danger,
             custom_id=f"reject_{request_id}"
         )
@@ -209,7 +206,7 @@ class ReviewView(discord.ui.View):
         self.add_item(reject_btn)
 
     async def accept_callback(self, interaction: discord.Interaction):
-        print(f"🔘 قبول [{self.request_id}] user={self.user_id}")
+        print(f"قبول [{self.request_id}] user={self.user_id}")
         await interaction.response.defer()
 
         guild = bot.get_guild(self.guild_id)
@@ -219,7 +216,7 @@ class ReviewView(discord.ui.View):
             try:
                 dest_channel = await bot.fetch_channel(self.target_channel_id)
             except Exception as e:
-                print(f"❌ فشل جلب القناة: {e}")
+                print(f"فشل جلب القناة: {e}")
         else:
             if guild:
                 try:
@@ -241,9 +238,9 @@ class ReviewView(discord.ui.View):
                         name=channel_name, category=category,
                         overwrites=overwrites, reason="طلب مقبول"
                     )
-                    print(f"✅ تم إنشاء القناة: {dest_channel.name}")
+                    print(f"تم انشاء القناة: {dest_channel.name}")
                 except Exception as e:
-                    print(f"❌ فشل إنشاء القناة: {e}")
+                    print(f"فشل انشاء القناة: {e}")
 
         if dest_channel:
             try:
@@ -251,40 +248,40 @@ class ReviewView(discord.ui.View):
                 if stored:
                     fb = stored["bytes"]
                     fname = stored["filename"]
-                    print(f"📤 إرسال الملف ({len(fb)} bytes) → {dest_channel.name}")
+                    print(f"ارسال الملف ({len(fb)} bytes) -> {dest_channel.name}")
                     file = discord.File(io.BytesIO(fb), filename=fname)
                     content = self.extra_text if self.extra_text else None
                     await dest_channel.send(content=content, file=file)
                     del file_store[self.request_id]
                 else:
-                    print(f"⚠️ الملف غير موجود في المخزن [{self.request_id}]")
+                    print(f"الملف غير موجود في المخزن [{self.request_id}]")
             except Exception as e:
-                print(f"❌ فشل إرسال الملف: {e}")
+                print(f"فشل ارسال الملف: {e}")
 
         user = bot.get_user(self.user_id)
         if user:
             try:
-                msg = "✅ **تم قبول طلبك!**"
+                msg = "**تم قبول طلبك!**"
                 if dest_channel:
-                    msg += f"\n\n📌 الروم: {dest_channel.mention}"
+                    msg += f"\n\nالروم: {dest_channel.mention}"
                 await user.send(msg)
             except Exception:
                 pass
 
         try:
             log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
-            embed = discord.Embed(title="✅ طلب مقبول", color=discord.Color.green(), timestamp=datetime.utcnow())
+            embed = discord.Embed(title="طلب مقبول", color=discord.Color.green(), timestamp=datetime.utcnow())
             embed.add_field(name="العضو", value=f"<@{self.user_id}>", inline=True)
             embed.add_field(name="الروم", value=self.room_name, inline=True)
             await log_channel.send(embed=embed)
         except Exception as e:
-            print(f"❌ فشل اللوق: {e}")
+            print(f"فشل اللوق: {e}")
 
         try:
             await interaction.message.delete()
-            print(f"🗑️ تم حذف رسالة الطلب [{self.request_id}] من قناة الإدارة")
+            print(f"تم حذف رسالة الطلب [{self.request_id}] من قناة الادارة")
         except Exception as e:
-            print(f"⚠️ فشل حذف رسالة الطلب: {e}")
+            print(f"فشل حذف رسالة الطلب: {e}")
 
     async def reject_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
@@ -294,7 +291,7 @@ class ReviewView(discord.ui.View):
 
 class RejectModal(discord.ui.Modal, title="سبب الرفض"):
     reason = discord.ui.TextInput(
-        label="أدخل سبب الرفض",
+        label="ادخل سبب الرفض",
         placeholder="مثال: الصورة غير واضحة...",
         required=True, max_length=500
     )
@@ -312,32 +309,32 @@ class RejectModal(discord.ui.Modal, title="سبب الرفض"):
         user = bot.get_user(self.user_id)
         if user:
             try:
-                await user.send(f"❌ **تم رفض طلبك**\n\n**السبب:** {self.reason.value}")
+                await user.send(f"**تم رفض طلبك**\n\n**السبب:** {self.reason.value}")
             except Exception:
                 pass
 
         try:
             log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
-            embed = discord.Embed(title="❌ طلب مرفوض", color=discord.Color.red(), timestamp=datetime.utcnow())
+            embed = discord.Embed(title="طلب مرفوض", color=discord.Color.red(), timestamp=datetime.utcnow())
             embed.add_field(name="العضو", value=f"<@{self.user_id}>", inline=True)
             embed.add_field(name="الروم", value=self.room_name, inline=True)
             embed.add_field(name="السبب", value=self.reason.value, inline=False)
             await log_channel.send(embed=embed)
         except Exception as e:
-            print(f"❌ فشل اللوق: {e}")
+            print(f"فشل اللوق: {e}")
 
         try:
             await self.review_message.delete()
-            print(f"🗑️ تم حذف رسالة الطلب [{self.request_id}] من قناة الإدارة")
+            print(f"تم حذف رسالة الطلب [{self.request_id}] من قناة الادارة")
         except Exception as e:
-            print(f"⚠️ فشل حذف رسالة الطلب: {e}")
+            print(f"فشل حذف رسالة الطلب: {e}")
 
         file_store.pop(self.request_id, None)
 
 
 @bot.event
 async def on_ready():
-    print(f"✅ البوت شغال: {bot.user.name}")
+    print(f"البوت شغال: {bot.user.name}")
     print(f"ID: {bot.user.id}")
 
 
@@ -349,7 +346,6 @@ async def on_message(message):
     content = message.content.strip()
     user_id = message.author.id
 
-    # ── أمر -روم ──────────────────────────────────────────────────────────────
     if content.startswith("-روم"):
         lines = content.splitlines()
         first_line = lines[0].replace("-روم", "", 1).strip()
@@ -357,7 +353,7 @@ async def on_message(message):
 
         if not first_line:
             try:
-                await message.reply("⚠️ اكتب اسم الروم بعد `-روم`\nمثال:\n`-روم اسم-الروم`\nالكلام اللي تبيه", delete_after=10)
+                await message.reply("اكتب اسم الروم بعد `-روم`\nمثال:\n`-روم اسم-الروم`\nالكلام اللي تبيه", delete_after=10)
             except Exception:
                 pass
             return
@@ -365,14 +361,14 @@ async def on_message(message):
         target_channel = find_channel_by_name(message.guild, first_line)
         if not target_channel:
             try:
-                await message.reply(f"⚠️ ما لقيت روم باسم **{first_line}**، تأكد من الاسم.", delete_after=10)
+                await message.reply(f"ما لقيت روم باسم **{first_line}**، تاكد من الاسم.", delete_after=10)
             except Exception:
                 pass
             return
 
         if not message.attachments:
             try:
-                await message.reply("⚠️ لازم ترفق صورة أو مقطع مع الأمر.", delete_after=10)
+                await message.reply("لازم ترفق صورة او مقطع مع الامر.", delete_after=10)
             except Exception:
                 pass
             return
@@ -384,13 +380,13 @@ async def on_message(message):
 
         if not is_image and not is_video:
             try:
-                await message.reply("⚠️ الملف غير مدعوم. أرسل صورة أو مقطع فيديو.", delete_after=10)
+                await message.reply("الملف غير مدعوم. ارسل صورة او مقطع فيديو.", delete_after=10)
             except Exception:
                 pass
             return
 
         try:
-            print(f"⬇️ تحميل الملف (-روم)...")
+            print(f"تحميل الملف (-روم)...")
             raw_bytes = await download_file(attachment.url)
             orig_ext = attachment.filename.rsplit(".", 1)[-1].lower() if "." in attachment.filename else "jpg"
             orig_filename = f"preview.{orig_ext}"
@@ -399,7 +395,7 @@ async def on_message(message):
                 processed = add_watermark(raw_bytes)
                 stored_filename = "image.jpg"
             else:
-                print("🎬 إضافة واترمارك على الفيديو...")
+                print("اضافة واترمارك على الفيديو...")
                 processed = await add_video_watermark(raw_bytes, orig_ext)
                 stored_filename = "video.mp4"
 
@@ -424,16 +420,15 @@ async def on_message(message):
             )
 
             try:
-                await message.author.send("✅ استلمنا")
+                await message.author.send("استلمنا")
             except Exception:
                 pass
 
         except Exception as e:
-            print(f"❌ خطأ في أمر -روم: {e}")
+            print(f"خطا في امر -روم: {e}")
 
         return
 
-    # ── قناة الطلبات (روم جديد) ──────────────────────────────────────────────
     if message.channel.id == REQUEST_CHANNEL_ID:
         if message.id in processed_messages:
             return
@@ -460,10 +455,10 @@ async def on_message(message):
                 continue
 
             has_valid = True
-            print(f"{'📸' if is_image else '🎬'} طلب جديد من {message.author} - الروم: {room_name}")
+            print(f"طلب جديد من {message.author} - الروم: {room_name}")
 
             try:
-                print(f"⬇️ تحميل الملف...")
+                print(f"تحميل الملف...")
                 raw_bytes = await download_file(attachment.url)
                 orig_ext = attachment.filename.rsplit(".", 1)[-1].lower() if "." in attachment.filename else "jpg"
                 orig_filename = f"preview.{orig_ext}"
@@ -472,15 +467,15 @@ async def on_message(message):
                     processed = add_watermark(raw_bytes)
                     stored_filename = "image.jpg"
                 else:
-                    print("🎬 إضافة واترمارك على الفيديو...")
+                    print("اضافة واترمارك على الفيديو...")
                     processed = await add_video_watermark(raw_bytes, orig_ext)
                     stored_filename = "video.mp4"
 
                 request_id = uuid.uuid4().hex[:10]
                 file_store[request_id] = {"bytes": processed, "filename": stored_filename, "is_video": is_video}
-                print(f"✅ الملف جاهز ({len(processed)} bytes)")
+                print(f"الملف جاهز ({len(processed)} bytes)")
             except Exception as e:
-                print(f"⚠️ فشل تحميل/واترمارك: {e}")
+                print(f"فشل تحميل/واترمارك: {e}")
                 continue
 
             await send_review(
@@ -497,13 +492,13 @@ async def on_message(message):
 
             try:
                 log_channel = await bot.fetch_channel(LOG_CHANNEL_ID)
-                embed = discord.Embed(title="📥 طلب جديد", color=discord.Color.blue(), timestamp=datetime.utcnow())
+                embed = discord.Embed(title="طلب جديد", color=discord.Color.blue(), timestamp=datetime.utcnow())
                 embed.add_field(name="الروم", value=room_name, inline=True)
-                embed.add_field(name="النوع", value="🎬 فيديو" if is_video else "📸 صورة", inline=True)
-                embed.add_field(name="الحالة", value="⏳ قيد المراجعة", inline=True)
+                embed.add_field(name="النوع", value="فيديو" if is_video else "صورة", inline=True)
+                embed.add_field(name="الحالة", value="قيد المراجعة", inline=True)
                 await log_channel.send(embed=embed)
             except Exception as e:
-                print(f"⚠️ فشل اللوق: {e}")
+                print(f"فشل اللوق: {e}")
 
         if has_valid:
             try:
@@ -511,7 +506,7 @@ async def on_message(message):
             except Exception:
                 pass
             try:
-                await message.author.send("✅ استلمنا")
+                await message.author.send("استلمنا")
             except Exception:
                 pass
         else:
@@ -527,9 +522,9 @@ async def on_message(message):
 @commands.has_permissions(administrator=True)
 async def pending_cmd(ctx):
     if not file_store:
-        await ctx.send("✅ لا توجد طلبات معلقة حالياً.")
+        await ctx.send("لا توجد طلبات معلقة حالياً.")
         return
-    embed = discord.Embed(title="⏳ الطلبات المعلقة", color=discord.Color.orange(), timestamp=datetime.utcnow())
+    embed = discord.Embed(title="الطلبات المعلقة", color=discord.Color.orange(), timestamp=datetime.utcnow())
     for rid in file_store:
         embed.add_field(name=f"ID: {rid}", value="قيد المراجعة", inline=False)
     await ctx.send(embed=embed)
@@ -552,14 +547,14 @@ async def purge_cmd(ctx, amount: int = None):
         try:
             target = await ctx.channel.fetch_message(ctx.message.reference.message_id)
             await target.delete()
-            await ctx.send("🗑️ تم الحذف.", delete_after=3)
+            await ctx.send("تم الحذف.", delete_after=3)
         except Exception as e:
-            print(f"⚠️ فشل مسح الرسالة: {e}")
+            print(f"فشل مسح الرسالة: {e}")
         return
 
     n = amount if amount else 10
     deleted = await ctx.channel.purge(limit=n)
-    await ctx.send(f"🗑️ تم حذف {len(deleted)} رسالة.", delete_after=4)
+    await ctx.send(f"تم حذف {len(deleted)} رسالة.", delete_after=4)
 
 
 bot.run(TOKEN)
