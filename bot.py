@@ -6,6 +6,7 @@ import aiohttp
 import asyncio
 import tempfile
 import uuid
+import time
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
@@ -557,4 +558,11 @@ async def purge_cmd(ctx, amount: int = None):
     await ctx.send(f"تم حذف {len(deleted)} رسالة.", delete_after=4)
 
 
-bot.run(TOKEN)
+while True:
+    try:
+        bot.run(TOKEN)
+    except Exception as e:
+        print(f"البوت توقف بسبب: {e}")
+        print("اعادة التشغيل بعد 5 ثواني...")
+        time.sleep(5)
+        bot = commands.Bot(command_prefix="!", intents=intents)
