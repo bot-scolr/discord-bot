@@ -7,10 +7,12 @@ Discord Bot - نظام الموافقة على الرومات
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
@@ -54,6 +56,27 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 processing_lock:    asyncio.Lock    = asyncio.Lock()
 processed_messages: set[int]       = set()
 pending_requests:   dict[int, dict] = {}   # {admin_msg_id: request_data}
+
+PENDING_FILE = Path("pending_requests.json")
+
+def _save_pending() -> None:
+    try:
+        PENDING_FILE.write_text(
+            json.dumps({str(k): v for k, v in pending_requests.items()}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.error(f"[SAVE] فشل حفظ الطلبات: {exc}")
+
+def _load_pending() -> None:
+    if not PENDING_FILE.exists():
+        return
+    try:
+        raw = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+        pending_requests.update({int(k): v for k, v in raw.items()})
+        logger.info(f"[LOAD] تم تحميل {len(pending_requests)} طلب من الملف.")
+    except Exception as exc:
+        logger.error(f"[LOAD] فشل تحميل الطلبات: {exc}")
 
 # =============================================================================
 # HELPERS
@@ -151,8 +174,6 @@ async def send_all_content(
     *,
     is_addition: bool = False,
 ) -> None:
-    member = guild.get_member(data["member_id"])
-
     label = "اضافة محتوى" if is_addition else data["room_name"]
     intro = discord.Embed(
         title=label,
@@ -160,13 +181,7 @@ async def send_all_content(
         color=discord.Color.blurple(),
         timestamp=datetime.now(timezone.utc),
     )
-    intro.set_footer(text=f"بواسطة {data['member_name']}")
-    if member and member.display_avatar:
-        intro.set_author(
-            name=data["member_name"],
-            icon_url=member.display_avatar.url,
-        )
-
+    # الاسم مخفي — لا يظهر في الروم
     await channel.send(embed=intro)
 
     if data["text"]:
@@ -266,6 +281,7 @@ class ApprovalView(discord.ui.View):
             reviewer=interaction.user,
         )
         pending_requests.pop(interaction.message.id, None)
+        _save_pending()
         logger.info(
             f"[REJECT] {interaction.user} رفض طلب '{data['room_name']}' "
             f"(وضع: {data['mode']}) من {data['member_name']}"
@@ -328,6 +344,7 @@ class ApprovalView(discord.ui.View):
 
             await send_all_content(channel, data, guild, is_addition=True)
             pending_requests.pop(interaction.message.id, None)
+            _save_pending()
             await interaction.followup.send(
                 f"تم اضافة المحتوى الى: {channel.mention}", ephemeral=True
             )
@@ -371,6 +388,7 @@ class ApprovalView(discord.ui.View):
 
             await send_all_content(channel, data, guild, is_addition=False)
             pending_requests.pop(interaction.message.id, None)
+            _save_pending()
             await interaction.followup.send(
                 f"تم انشاء الروم: {channel.mention}", ephemeral=True
             )
@@ -393,6 +411,7 @@ class ApprovalView(discord.ui.View):
 
 @bot.event
 async def on_ready():
+    _load_pending()
     logger.info(f"البوت جاهز: {bot.user} (ID: {bot.user.id})")
     logger.info(f"   روم الادارة    : {ADMIN_CHANNEL_ID}")
     logger.info(f"   روم الطلبات    : {REQUEST_CHANNEL_ID}")
@@ -413,6 +432,11 @@ async def on_message(message: discord.Message):
     if message.channel.id != REQUEST_CHANNEL_ID:
         return
 
+    # يجب أن تبدأ الرسالة بـ -روم
+    content = (message.content or "").strip()
+    if not content.startswith("-روم"):
+        return
+
     async with processing_lock:
         if message.id in processed_messages:
             logger.warning(f"[SKIP] رسالة مكررة: {message.id}")
@@ -431,8 +455,15 @@ async def handle_room_request(message: discord.Message):
         logger.error(f"[ERROR] روم الادارة غير موجود: {ADMIN_CHANNEL_ID}")
         return
 
-    lines       = [l for l in (message.content or "").strip().splitlines() if l.strip()]
-    raw_name    = lines[0] if lines else f"روم-{message.author.display_name}"
+    # ── تحليل الصيغة: -روم اسم-الروم ─────────────────────────────────────
+    # السطر الأول: -روم <اسم الروم>
+    # باقي الأسطر: الكلام / الوصف
+    lines = [l for l in (message.content or "").strip().splitlines() if l.strip()]
+    first_line = lines[0] if lines else ""
+
+    # استخراج اسم الروم من بعد كلمة -روم
+    after_cmd = first_line[len("-روم"):].strip()
+    raw_name  = after_cmd if after_cmd else f"روم-{message.author.display_name}"
     description = "\n".join(lines[1:]) if len(lines) > 1 else ""
     room_name   = sanitize_channel_name(raw_name)
 
@@ -497,6 +528,7 @@ async def handle_room_request(message: discord.Message):
         "mode":                mode,
         "existing_channel_id": existing_channel.id if existing_channel else None,
     }
+    _save_pending()
 
     logger.info(
         f"[REQUEST] من {message.author} | روم: {room_name} | "
@@ -519,9 +551,10 @@ async def handle_room_request(message: discord.Message):
                 )
 
     try:
-        await message.add_reaction("⏳")
-    except discord.Forbidden:
-        pass
+        await message.delete()
+        logger.info(f"[DELETE] تم حذف رسالة الطلب {message.id} من روم الطلبات")
+    except Exception as exc:
+        logger.warning(f"[DELETE] تعذّر حذف الرسالة {message.id}: {exc}")
 
 # =============================================================================
 # COMMANDS
