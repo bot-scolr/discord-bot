@@ -18,6 +18,7 @@ from typing import Optional
 import aiohttp
 import discord
 from discord.ext import commands
+from PIL import Image, ImageDraw, ImageFont
 
 # =============================================================================
 # LOGGING SETUP
@@ -167,6 +168,82 @@ async def _notify_member(
         logger.error(f"[DM] خطأ في ارسال DM لـ {member}: {exc}")
 
 
+WATERMARK_TEXT = "© Depth Of School"
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+
+def _add_watermark(raw: bytes, filename: str) -> bytes:
+    """أضف نص حقوق في ثلاث مواضع: فوق يمين، وسط، تحت يسار."""
+    try:
+        img = Image.open(io.BytesIO(raw)).convert("RGBA")
+        w, h = img.size
+
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw    = ImageDraw.Draw(overlay)
+
+        font_size = max(16, w // 28)
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size
+            )
+        except Exception:
+            font = ImageFont.load_default()
+
+        bbox   = draw.textbbox((0, 0), WATERMARK_TEXT, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        margin = 12
+
+        positions = [
+            (w - tw - margin,       margin),            # فوق يمين
+            ((w - tw) // 2,         (h - th) // 2),     # وسط
+            (margin,                h - th - margin),   # تحت يسار
+        ]
+
+        for (x, y) in positions:
+            # ظل
+            draw.text((x + 2, y + 2), WATERMARK_TEXT, font=font, fill=(0, 0, 0, 160))
+            # النص الأبيض
+            draw.text((x,     y    ), WATERMARK_TEXT, font=font, fill=(255, 255, 255, 210))
+
+        out = Image.alpha_composite(img, overlay).convert("RGB")
+        buf = io.BytesIO()
+        ext = Path(filename).suffix.lower()
+        fmt = "JPEG" if ext in (".jpg", ".jpeg") else "PNG"
+        out.save(buf, format=fmt, quality=92)
+        buf.seek(0)
+        return buf.read()
+    except Exception as exc:
+        logger.warning(f"[WATERMARK] فشل إضافة الحقوق على {filename}: {exc}")
+        return raw
+
+
+async def _download_attachment(session: aiohttp.ClientSession, att: dict) -> Optional[discord.File]:
+    """حمّل المرفق وأضف الحقوق إن كان صورة، ثم أرجعه كـ discord.File."""
+    for url_key in ("url", "proxy_url"):
+        url = att.get(url_key)
+        if not url:
+            continue
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"[ATTACH] HTTP {resp.status} لـ {att['filename']} ({url_key})")
+                    continue
+                raw = await resp.read()
+
+                # أضف الحقوق المائية للصور فقط (ليس الفيديو أو الصوت)
+                ext = Path(att["filename"]).suffix.lower()
+                if ext in IMAGE_EXTS and att.get("type_label") in ("صورة", "GIF"):
+                    raw = _add_watermark(raw, att["filename"])
+
+                logger.info(f"[ATTACH] {att['filename']} ({att['type_label']})")
+                return discord.File(fp=io.BytesIO(raw), filename=att["filename"])
+        except asyncio.TimeoutError:
+            logger.warning(f"[ATTACH] Timeout - {att['filename']} ({url_key})")
+        except Exception as exc:
+            logger.error(f"[ATTACH] خطأ - {att['filename']} ({url_key}): {exc}")
+    return None
+
+
 async def send_all_content(
     channel: discord.TextChannel,
     data: dict,
@@ -174,51 +251,34 @@ async def send_all_content(
     *,
     is_addition: bool = False,
 ) -> None:
-    label = "اضافة محتوى" if is_addition else data["room_name"]
-    intro = discord.Embed(
-        title=label,
-        description=data["description"] or "",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    # الاسم مخفي — لا يظهر في الروم
-    await channel.send(embed=intro)
+    """أرسل الكلام + جميع المرفقات في رسالة وحدة (أو دفعات إن تجاوزت 10)."""
 
-    if data["text"]:
-        await channel.send(data["text"])
+    text = data["description"] or ""
 
+    # جهّز الملفات أولاً
+    files: list[discord.File] = []
     async with aiohttp.ClientSession() as session:
         for att in data["attachments"]:
-            sent = False
-            for url_key in ("url", "proxy_url"):
-                url = att.get(url_key)
-                if not url:
-                    continue
-                try:
-                    async with session.get(
-                        url, timeout=aiohttp.ClientTimeout(total=60)
-                    ) as resp:
-                        if resp.status == 200:
-                            raw  = await resp.read()
-                            file = discord.File(
-                                fp=io.BytesIO(raw),
-                                filename=att["filename"],
-                            )
-                            await channel.send(file=file)
-                            logger.info(f"[ATTACH] {att['filename']} ({att['type_label']})")
-                            sent = True
-                            break
-                        logger.warning(
-                            f"[ATTACH] HTTP {resp.status} لـ {att['filename']} ({url_key})"
-                        )
-                except asyncio.TimeoutError:
-                    logger.warning(f"[ATTACH] Timeout - {att['filename']} ({url_key})")
-                except Exception as exc:
-                    logger.error(f"[ATTACH] خطأ - {att['filename']} ({url_key}): {exc}")
+            f = await _download_attachment(session, att)
+            if f:
+                files.append(f)
+            else:
+                logger.error(f"[ATTACH] فشل تحميل {att['filename']}")
 
-            if not sent:
-                logger.error(f"[ATTACH] فشل ارسال {att['filename']}")
-                await channel.send(f"تعذّر ارسال: `{att['filename']}`")
+    # الرسالة الأولى: إما embed (روم جديد) أو نص + أول 10 ملفات
+    BATCH = 10
+    first_files  = files[:BATCH]
+    extra_files  = files[BATCH:]
+
+    # كلام فوق + ملفات — بدون أي embed أو header
+    await channel.send(
+        content=text or None,
+        files=first_files if first_files else discord.utils.MISSING,
+    )
+
+    # دفعات إضافية لو كان في أكثر من 10 ملفات
+    for i in range(0, len(extra_files), BATCH):
+        await channel.send(files=extra_files[i : i + BATCH])
 
 # =============================================================================
 # APPROVAL VIEW
@@ -432,9 +492,8 @@ async def on_message(message: discord.Message):
     if message.channel.id != REQUEST_CHANNEL_ID:
         return
 
-    # يجب أن تبدأ الرسالة بـ -روم
-    content = (message.content or "").strip()
-    if not content.startswith("-روم"):
+    # تجاهل الرسائل الفارغة (بدون نص ومرفقات)
+    if not message.content.strip() and not message.attachments:
         return
 
     async with processing_lock:
@@ -455,15 +514,11 @@ async def handle_room_request(message: discord.Message):
         logger.error(f"[ERROR] روم الادارة غير موجود: {ADMIN_CHANNEL_ID}")
         return
 
-    # ── تحليل الصيغة: -روم اسم-الروم ─────────────────────────────────────
-    # السطر الأول: -روم <اسم الروم>
+    # ── تحليل الرسالة ─────────────────────────────────────────────────────
+    # السطر الأول: اسم الروم
     # باقي الأسطر: الكلام / الوصف
     lines = [l for l in (message.content or "").strip().splitlines() if l.strip()]
-    first_line = lines[0] if lines else ""
-
-    # استخراج اسم الروم من بعد كلمة -روم
-    after_cmd = first_line[len("-روم"):].strip()
-    raw_name  = after_cmd if after_cmd else f"روم-{message.author.display_name}"
+    raw_name    = lines[0].strip() if lines else f"روم-{message.author.display_name}"
     description = "\n".join(lines[1:]) if len(lines) > 1 else ""
     room_name   = sanitize_channel_name(raw_name)
 
