@@ -1,27 +1,22 @@
 """
-Discord Bot - نظام الموافقة على الرومات
-=========================================
-الوضع 1: اسم روم جديد - يُنشأ الروم بعد الموافقة
-الوضع 2: اسم روم موجود - يُضاف المحتوى للروم الموجود بعد الموافقة
+Discord Bot - حماية + مودريشن
+================================
+- منع Threads تلقائياً (باند فوري)
+- أوامر بدون بادئة: برا، طرد، اص، تايم، فك، اسم، رول، تل، ق، ف، warn، warns، clearwarns، clear، userinfo، serverinfo
 """
 
-import asyncio
-import io
 import json
 import logging
 import os
-import re
-from datetime import datetime, timezone
+import shlex
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
 
-import aiohttp
 import discord
 from discord.ext import commands
-from PIL import Image, ImageDraw, ImageFont
 
 # =============================================================================
-# LOGGING SETUP
+# LOGGING
 # =============================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -32,631 +27,410 @@ logging.basicConfig(
         logging.FileHandler("bot.log", encoding="utf-8"),
     ],
 )
-logger = logging.getLogger("RoomBot")
+logger = logging.getLogger("ModBot")
 
 # =============================================================================
-# CONFIGURATION
+# CONFIG
 # =============================================================================
-TOKEN                = os.getenv("DISCORD_TOKEN", "")
-ADMIN_CHANNEL_ID     = int(os.getenv("ADMIN_CHANNEL_ID", "0"))
-REQUEST_CHANNEL_ID   = int(os.getenv("REQUEST_CHANNEL_ID", "0"))
-APPROVED_CATEGORY_ID = int(os.getenv("APPROVED_CATEGORY_ID", "0"))
+TOKEN = os.getenv("DISCORD_TOKEN", "")
+
+# =============================================================================
+# WARNINGS STORAGE
+# =============================================================================
+WARNS_FILE = Path("warnings.json")
+
+def _load_warns() -> dict:
+    if not WARNS_FILE.exists():
+        return {}
+    try:
+        return json.loads(WARNS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _save_warns(data: dict) -> None:
+    WARNS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # =============================================================================
 # BOT SETUP
 # =============================================================================
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
+intents.members         = True
+intents.guilds          = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# =============================================================================
-# GLOBAL STATE
-# =============================================================================
-processing_lock:    asyncio.Lock    = asyncio.Lock()
-processed_messages: set[int]       = set()
-pending_requests:   dict[int, dict] = {}   # {admin_msg_id: request_data}
-
-PENDING_FILE = Path("pending_requests.json")
-
-def _save_pending() -> None:
-    try:
-        PENDING_FILE.write_text(
-            json.dumps({str(k): v for k, v in pending_requests.items()}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        logger.error(f"[SAVE] فشل حفظ الطلبات: {exc}")
-
-def _load_pending() -> None:
-    if not PENDING_FILE.exists():
-        return
-    try:
-        raw = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
-        pending_requests.update({int(k): v for k, v in raw.items()})
-        logger.info(f"[LOAD] تم تحميل {len(pending_requests)} طلب من الملف.")
-    except Exception as exc:
-        logger.error(f"[LOAD] فشل تحميل الطلبات: {exc}")
+bot = commands.Bot(command_prefix="\x00", intents=intents, help_command=None)
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
-def sanitize_channel_name(name: str) -> str:
-    name = name.strip()
-    name = re.sub(r"[^\w\s\u0600-\u06FF\-]", "", name)
-    name = re.sub(r"\s+", "-", name)
-    name = name.strip("-")
-    return name[:100] or "روم-جديد"
+def _is_mod(member: discord.Member) -> bool:
+    p = member.guild_permissions
+    return p.administrator or p.ban_members or p.kick_members or p.moderate_members
 
+def _mod_embed(title: str, color: discord.Color, **fields) -> discord.Embed:
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+    for name, value in fields.items():
+        embed.add_field(name=name, value=str(value), inline=True)
+    return embed
 
-def get_attachment_type_label(attachment: discord.Attachment) -> str:
-    ct = (attachment.content_type or "").lower()
-    fn = attachment.filename.lower()
-    if ct.startswith("image/gif") or fn.endswith(".gif"):
-        return "GIF"
-    if ct.startswith("image/"):
-        return "صورة"
-    if ct.startswith("video/"):
-        return "فيديو"
-    if ct.startswith("audio/") or fn.endswith((".ogg", ".wav", ".mp3", ".m4a", ".flac")):
-        return "صوت/فويس"
-    return "ملف"
+def _parse_duration(text: str) -> int | None:
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if text and text[-1] in units:
+        try:
+            return int(text[:-1]) * units[text[-1]]
+        except ValueError:
+            return None
+    try:
+        return int(text) * 60
+    except ValueError:
+        return None
 
-
-def build_attachment_summary(attachments: list[dict]) -> str:
-    if not attachments:
-        return "_لا توجد مرفقات_"
-    counts: dict[str, int] = {}
-    for att in attachments:
-        counts[att["type_label"]] = counts.get(att["type_label"], 0) + 1
-    return "\n".join(f"{lbl}: **{cnt}**" for lbl, cnt in counts.items())
-
-
-def find_existing_channel(
-    guild: discord.Guild, room_name: str
-) -> Optional[discord.TextChannel]:
-    normalized = room_name.lower().replace(" ", "-")
-    for ch in guild.text_channels:
-        if ch.name.lower() == normalized:
-            return ch
-    return None
-
-
-async def _notify_member(
-    guild: discord.Guild,
-    member_id: int,
-    approved: bool,
-    room_name: str,
-    channel: Optional[discord.TextChannel],
-    reviewer: discord.Member,
-) -> None:
-    member = guild.get_member(member_id)
-    if not member:
-        logger.warning(f"[DM] العضو {member_id} غير موجود في السيرفر.")
-        return
-
-    if approved:
-        embed = discord.Embed(
-            title="تمت الموافقة على طلبك",
-            color=discord.Color.green(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="الروم",   value=room_name,                                  inline=True)
-        embed.add_field(name="الرابط",  value=channel.mention if channel else "—",         inline=True)
-        embed.add_field(name="المراجع", value=str(reviewer),                               inline=True)
-        embed.set_footer(text=f"السيرفر: {guild.name}",
-                         icon_url=guild.icon.url if guild.icon else None)
-    else:
-        embed = discord.Embed(
-            title="تم رفض طلبك",
-            color=discord.Color.red(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="الروم المطلوب", value=room_name,      inline=True)
-        embed.add_field(name="المراجع",       value=str(reviewer),  inline=True)
-        embed.set_footer(text=f"السيرفر: {guild.name}",
-                         icon_url=guild.icon.url if guild.icon else None)
-
+async def _dm(member: discord.Member, embed: discord.Embed) -> None:
     try:
         await member.send(embed=embed)
-        logger.info(f"[DM] ارسل اشعار {'قبول' if approved else 'رفض'} لـ {member}")
-    except discord.Forbidden:
-        logger.warning(f"[DM] {member} اغلق الرسائل الخاصة.")
-    except Exception as exc:
-        logger.error(f"[DM] خطأ في ارسال DM لـ {member}: {exc}")
+    except Exception:
+        pass
 
-
-WATERMARK_TEXT = "© Depth Of School"
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
-
-
-def _add_watermark(raw: bytes, filename: str) -> bytes:
-    """أضف نص حقوق في ثلاث مواضع: فوق يمين، وسط، تحت يسار."""
+def _parse_args(content: str):
+    """تقسيم الرسالة لقائمة كلمات."""
     try:
-        img = Image.open(io.BytesIO(raw)).convert("RGBA")
-        w, h = img.size
+        return shlex.split(content)
+    except ValueError:
+        return content.split()
 
-        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw    = ImageDraw.Draw(overlay)
+async def _resolve_member(guild: discord.Guild, mention_or_id: str) -> discord.Member | None:
+    """جيب العضو من المنشن أو الـ ID."""
+    text = mention_or_id.strip("<@!>")
+    try:
+        uid = int(text)
+        return guild.get_member(uid) or await guild.fetch_member(uid)
+    except Exception:
+        return None
 
-        font_size = max(16, w // 28)
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size
-            )
-        except Exception:
-            font = ImageFont.load_default()
+async def _resolve_role(guild: discord.Guild, mention_or_id: str) -> discord.Role | None:
+    text = mention_or_id.strip("<@&>")
+    try:
+        rid = int(text)
+        return guild.get_role(rid)
+    except Exception:
+        return None
 
-        bbox   = draw.textbbox((0, 0), WATERMARK_TEXT, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        margin = 12
+async def _no_perm(message: discord.Message):
+    await message.reply("ما عندك صلاحية.", delete_after=4)
 
-        positions = [
-            (w - tw - margin,       margin),            # فوق يمين
-            ((w - tw) // 2,         (h - th) // 2),     # وسط
-            (margin,                h - th - margin),   # تحت يسار
-        ]
-
-        for (x, y) in positions:
-            # ظل
-            draw.text((x + 2, y + 2), WATERMARK_TEXT, font=font, fill=(0, 0, 0, 160))
-            # النص الأبيض
-            draw.text((x,     y    ), WATERMARK_TEXT, font=font, fill=(255, 255, 255, 210))
-
-        out = Image.alpha_composite(img, overlay).convert("RGB")
-        buf = io.BytesIO()
-        ext = Path(filename).suffix.lower()
-        fmt = "JPEG" if ext in (".jpg", ".jpeg") else "PNG"
-        out.save(buf, format=fmt, quality=92)
-        buf.seek(0)
-        return buf.read()
-    except Exception as exc:
-        logger.warning(f"[WATERMARK] فشل إضافة الحقوق على {filename}: {exc}")
-        return raw
-
-
-async def _download_attachment(session: aiohttp.ClientSession, att: dict) -> Optional[discord.File]:
-    """حمّل المرفق وأضف الحقوق إن كان صورة، ثم أرجعه كـ discord.File."""
-    for url_key in ("url", "proxy_url"):
-        url = att.get(url_key)
-        if not url:
-            continue
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"[ATTACH] HTTP {resp.status} لـ {att['filename']} ({url_key})")
-                    continue
-                raw = await resp.read()
-
-                # أضف الحقوق المائية للصور فقط (ليس الفيديو أو الصوت)
-                ext = Path(att["filename"]).suffix.lower()
-                if ext in IMAGE_EXTS and att.get("type_label") in ("صورة", "GIF"):
-                    raw = _add_watermark(raw, att["filename"])
-
-                logger.info(f"[ATTACH] {att['filename']} ({att['type_label']})")
-                return discord.File(fp=io.BytesIO(raw), filename=att["filename"])
-        except asyncio.TimeoutError:
-            logger.warning(f"[ATTACH] Timeout - {att['filename']} ({url_key})")
-        except Exception as exc:
-            logger.error(f"[ATTACH] خطأ - {att['filename']} ({url_key}): {exc}")
-    return None
-
-
-async def send_all_content(
-    channel: discord.TextChannel,
-    data: dict,
-    guild: discord.Guild,
-    *,
-    is_addition: bool = False,
-) -> None:
-    """أرسل الكلام + جميع المرفقات في رسالة وحدة (أو دفعات إن تجاوزت 10)."""
-
-    text = data["description"] or ""
-
-    # جهّز الملفات أولاً
-    files: list[discord.File] = []
-    async with aiohttp.ClientSession() as session:
-        for att in data["attachments"]:
-            f = await _download_attachment(session, att)
-            if f:
-                files.append(f)
-            else:
-                logger.error(f"[ATTACH] فشل تحميل {att['filename']}")
-
-    # الرسالة الأولى: إما embed (روم جديد) أو نص + أول 10 ملفات
-    BATCH = 10
-    first_files  = files[:BATCH]
-    extra_files  = files[BATCH:]
-
-    # كلام فوق + ملفات — بدون أي embed أو header
-    await channel.send(
-        content=text or None,
-        files=first_files if first_files else discord.utils.MISSING,
-    )
-
-    # دفعات إضافية لو كان في أكثر من 10 ملفات
-    for i in range(0, len(extra_files), BATCH):
-        await channel.send(files=extra_files[i : i + BATCH])
+async def _usage(message: discord.Message, text: str):
+    await message.reply(f"الاستخدام: `{text}`", delete_after=5)
 
 # =============================================================================
-# APPROVAL VIEW
-# =============================================================================
-
-class ApprovalView(discord.ui.View):
-
-    def __init__(self, admin_msg_id: int = 0):
-        super().__init__(timeout=None)
-        self.admin_msg_id = admin_msg_id
-
-    @discord.ui.button(
-        label="قبول",
-        style=discord.ButtonStyle.success,
-        custom_id="room_approve",
-    )
-    async def approve_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer(ephemeral=True)
-
-        data = pending_requests.get(interaction.message.id)
-        if not data:
-            await interaction.followup.send(
-                "لم يتم العثور على بيانات الطلب. ربما اُعيد تشغيل البوت.",
-                ephemeral=True,
-            )
-            return
-
-        await self._update_embed(
-            interaction,
-            status="تمت الموافقة",
-            color=discord.Color.green(),
-            reviewer=interaction.user,
-        )
-        await self._handle_approval(interaction, data)
-
-    @discord.ui.button(
-        label="رفض",
-        style=discord.ButtonStyle.danger,
-        custom_id="room_reject",
-    )
-    async def reject_button(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ):
-        await interaction.response.defer(ephemeral=True)
-
-        data = pending_requests.get(interaction.message.id)
-        if not data:
-            await interaction.followup.send(
-                "لم يتم العثور على بيانات الطلب.",
-                ephemeral=True,
-            )
-            return
-
-        await self._update_embed(
-            interaction,
-            status="مرفوض",
-            color=discord.Color.red(),
-            reviewer=interaction.user,
-        )
-        pending_requests.pop(interaction.message.id, None)
-        _save_pending()
-        logger.info(
-            f"[REJECT] {interaction.user} رفض طلب '{data['room_name']}' "
-            f"(وضع: {data['mode']}) من {data['member_name']}"
-        )
-        await interaction.followup.send("تم رفض الطلب.", ephemeral=True)
-        await _notify_member(
-            guild=interaction.guild,
-            member_id=data["member_id"],
-            approved=False,
-            room_name=data["room_name"],
-            channel=None,
-            reviewer=interaction.user,
-        )
-
-    async def _update_embed(
-        self,
-        interaction: discord.Interaction,
-        status: str,
-        color: discord.Color,
-        reviewer: discord.Member,
-    ):
-        for child in self.children:
-            child.disabled = True
-
-        embed = interaction.message.embeds[0]
-        embed.color = color
-
-        new_fields = []
-        for field in embed.fields:
-            if field.name == "الحالة":
-                new_fields.append({"name": "الحالة", "value": status, "inline": True})
-            else:
-                new_fields.append(
-                    {"name": field.name, "value": field.value, "inline": field.inline}
-                )
-        embed.clear_fields()
-        for f in new_fields:
-            embed.add_field(**f)
-
-        embed.add_field(name="المراجع",      value=reviewer.mention,                                  inline=True)
-        embed.add_field(name="وقت المراجعة", value=discord.utils.format_dt(datetime.now(timezone.utc), "F"), inline=True)
-        await interaction.message.edit(embed=embed, view=self)
-
-    async def _handle_approval(self, interaction: discord.Interaction, data: dict):
-        guild = interaction.guild
-        mode  = data["mode"]
-
-        if mode == "existing":
-            channel = guild.get_channel(data["existing_channel_id"])
-            if not channel:
-                channel = find_existing_channel(guild, data["room_name"])
-
-            if not channel:
-                await interaction.followup.send(
-                    f"الروم `{data['room_name']}` لم يُعد موجوداً.",
-                    ephemeral=True,
-                )
-                pending_requests.pop(interaction.message.id, None)
-                return
-
-            await send_all_content(channel, data, guild, is_addition=True)
-            pending_requests.pop(interaction.message.id, None)
-            _save_pending()
-            await interaction.followup.send(
-                f"تم اضافة المحتوى الى: {channel.mention}", ephemeral=True
-            )
-            logger.info(
-                f"[APPROVE-ADD] {interaction.user} اضاف محتوى لـ #{channel.name} "
-                f"من {data['member_name']}"
-            )
-            await _notify_member(
-                guild=guild,
-                member_id=data["member_id"],
-                approved=True,
-                room_name=data["room_name"],
-                channel=channel,
-                reviewer=interaction.user,
-            )
-
-        else:
-            try:
-                category: Optional[discord.CategoryChannel] = None
-                if APPROVED_CATEGORY_ID:
-                    category = guild.get_channel(APPROVED_CATEGORY_ID)
-
-                channel = await guild.create_text_channel(
-                    name=data["room_name"],
-                    category=category,
-                    topic=(data["description"] or "")[:1024] or None,
-                    reason=f"طلب موافق عليه من {data['member_name']}",
-                )
-                logger.info(f"[CREATE] #{channel.name} (ID: {channel.id})")
-
-            except discord.Forbidden:
-                logger.error("[CREATE] لا يوجد صلاحية لانشاء الروم.")
-                await interaction.followup.send(
-                    "البوت لا يملك صلاحية انشاء الروم.", ephemeral=True
-                )
-                return
-            except Exception as exc:
-                logger.exception(f"[CREATE] خطأ: {exc}")
-                await interaction.followup.send(f"حدث خطأ: {exc}", ephemeral=True)
-                return
-
-            await send_all_content(channel, data, guild, is_addition=False)
-            pending_requests.pop(interaction.message.id, None)
-            _save_pending()
-            await interaction.followup.send(
-                f"تم انشاء الروم: {channel.mention}", ephemeral=True
-            )
-            logger.info(
-                f"[APPROVE-NEW] {interaction.user} انشأ #{channel.name} "
-                f"من {data['member_name']}"
-            )
-            await _notify_member(
-                guild=guild,
-                member_id=data["member_id"],
-                approved=True,
-                room_name=data["room_name"],
-                channel=channel,
-                reviewer=interaction.user,
-            )
-
-# =============================================================================
-# EVENT: on_ready
+# EVENTS
 # =============================================================================
 
 @bot.event
 async def on_ready():
-    _load_pending()
     logger.info(f"البوت جاهز: {bot.user} (ID: {bot.user.id})")
-    logger.info(f"   روم الادارة    : {ADMIN_CHANNEL_ID}")
-    logger.info(f"   روم الطلبات    : {REQUEST_CHANNEL_ID}")
-    logger.info(f"   الكاتيقوري     : {APPROVED_CATEGORY_ID or 'غير محدد'}")
-    bot.add_view(ApprovalView())
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching, name="السيرفر"
+    ))
 
-# =============================================================================
-# EVENT: on_message
-# =============================================================================
+
+@bot.event
+async def on_thread_create(thread: discord.Thread):
+    guild    = thread.guild
+    owner_id = thread.owner_id
+    if not owner_id:
+        return
+    if thread.owner and thread.owner.bot:
+        return
+    logger.info(f"[THREAD] #{thread.name} | owner={owner_id}")
+    try:
+        await thread.delete()
+    except Exception as exc:
+        logger.error(f"[DELETE] {exc}")
+    try:
+        member = guild.get_member(owner_id) or await guild.fetch_member(owner_id)
+        if member and member.bot:
+            return
+        target = member or discord.Object(id=owner_id)
+        await guild.ban(target, reason="إنشاء Thread محظور", delete_message_days=0)
+        logger.info(f"[BAN-THREAD] {owner_id}")
+    except Exception as exc:
+        logger.error(f"[BAN-THREAD] {exc}")
+
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
-    await bot.process_commands(message)
-
-    if message.channel.id != REQUEST_CHANNEL_ID:
+    args = _parse_args(message.content)
+    if not args:
         return
 
-    # تجاهل الرسائل الفارغة (بدون نص ومرفقات)
-    if not message.content.strip() and not message.attachments:
-        return
+    cmd  = args[0].lower()
+    rest = args[1:]
+    guild  = message.guild
+    author = message.author
 
-    async with processing_lock:
-        if message.id in processed_messages:
-            logger.warning(f"[SKIP] رسالة مكررة: {message.id}")
-            return
-        processed_messages.add(message.id)
+    # ── برا / ban ──────────────────────────────────────────────────────────
+    if cmd in ("برا", "ban"):
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "برا @عضو [سبب]")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        if member.top_role >= author.top_role and author != guild.owner:
+            return await message.reply("رتبة العضو أعلى منك.", delete_after=4)
+        reason = " ".join(rest[1:]) or "لا يوجد سبب"
+        await _dm(member, _mod_embed("تم بانادك", discord.Color.red(),
+                                      السيرفر=guild.name, السبب=reason, المشرف=str(author)))
+        await guild.ban(member, reason=reason, delete_message_days=0)
+        await message.channel.send(embed=_mod_embed("تم الباند", discord.Color.red(),
+                                                     العضو=str(member), السبب=reason, المشرف=str(author)), delete_after=8)
+        logger.info(f"[BAN] {member} | {reason}")
 
-    await handle_room_request(message)
+    # ── unban ──────────────────────────────────────────────────────────────
+    elif cmd == "unban":
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "unban [ID] [سبب]")
+        try:
+            user = await bot.fetch_user(int(rest[0]))
+            reason = " ".join(rest[1:]) or "لا يوجد سبب"
+            await guild.unban(user, reason=reason)
+            await message.channel.send(embed=_mod_embed("تم رفع الباند", discord.Color.green(),
+                                                         العضو=str(user), السبب=reason, المشرف=str(author)), delete_after=8)
+        except Exception:
+            await message.reply("ID غير صحيح أو العضو غير موجود في الباند.", delete_after=4)
+
+    # ── طرد / kick ─────────────────────────────────────────────────────────
+    elif cmd in ("طرد", "kick"):
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "طرد @عضو [سبب]")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        if member.top_role >= author.top_role and author != guild.owner:
+            return await message.reply("رتبة العضو أعلى منك.", delete_after=4)
+        reason = " ".join(rest[1:]) or "لا يوجد سبب"
+        await _dm(member, _mod_embed("تم طردك", discord.Color.orange(),
+                                      السيرفر=guild.name, السبب=reason, المشرف=str(author)))
+        await member.kick(reason=reason)
+        await message.channel.send(embed=_mod_embed("تم الطرد", discord.Color.orange(),
+                                                     العضو=str(member), السبب=reason, المشرف=str(author)), delete_after=8)
+        logger.info(f"[KICK] {member} | {reason}")
+
+    # ── اص / تايم / mute ───────────────────────────────────────────────────
+    elif cmd in ("اص", "تايم", "mute"):
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "اص @عضو [مدة] [سبب]   (10m/2h/1d)")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        if member.top_role >= author.top_role and author != guild.owner:
+            return await message.reply("رتبة العضو أعلى منك.", delete_after=4)
+        duration = rest[1] if len(rest) > 1 else "10m"
+        reason   = " ".join(rest[2:]) or "لا يوجد سبب"
+        secs = _parse_duration(duration)
+        if not secs or secs > 2419200:
+            return await message.reply("مدة غير صحيحة. مثال: 10m، 2h، 1d", delete_after=4)
+        until = discord.utils.utcnow() + timedelta(seconds=secs)
+        await member.timeout(until, reason=reason)
+        await _dm(member, _mod_embed("تم إسكاتك", discord.Color.yellow(),
+                                      السيرفر=guild.name, المدة=duration, السبب=reason, المشرف=str(author)))
+        await message.channel.send(embed=_mod_embed("تم الإسكات", discord.Color.yellow(),
+                                                     العضو=str(member), المدة=duration, السبب=reason, المشرف=str(author)), delete_after=8)
+        logger.info(f"[MUTE] {member} | {duration} | {reason}")
+
+    # ── فك / unmute ────────────────────────────────────────────────────────
+    elif cmd in ("فك", "unmute"):
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "فك @عضو")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        await member.timeout(None)
+        await message.channel.send(embed=_mod_embed("تم رفع الإسكات", discord.Color.green(),
+                                                     العضو=str(member), المشرف=str(author)), delete_after=8)
+        logger.info(f"[UNMUTE] {member}")
+
+    # ── اسم / nickname ─────────────────────────────────────────────────────
+    elif cmd in ("اسم", "nick"):
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "اسم @عضو [الاسم الجديد]")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        new_nick = " ".join(rest[1:]).strip() or None
+        await member.edit(nick=new_nick)
+        text = f"`{new_nick}`" if new_nick else "تم إزالة النك نيم"
+        await message.channel.send(embed=_mod_embed("تم تغيير الاسم", discord.Color.blurple(),
+                                                     العضو=str(member), الاسم=text, المشرف=str(author)), delete_after=8)
+        logger.info(f"[NICK] {member} → {new_nick}")
+
+    # ── رول / addrole ──────────────────────────────────────────────────────
+    elif cmd in ("رول", "addrole"):
+        if not _is_mod(author): return await _no_perm(message)
+        if len(rest) < 2: return await _usage(message, "رول @عضو @رول")
+        member = await _resolve_member(guild, rest[0])
+        role   = await _resolve_role(guild, rest[1])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        if not role:   return await message.reply("الرول غير موجود.", delete_after=4)
+        if role >= author.top_role and author != guild.owner:
+            return await message.reply("لا تستطيع إعطاء رول أعلى منك.", delete_after=4)
+        await member.add_roles(role, reason=f"بواسطة {author}")
+        await message.channel.send(embed=_mod_embed("تم إعطاء الرول", discord.Color.green(),
+                                                     العضو=str(member), الرول=role.mention, المشرف=str(author)), delete_after=8)
+        logger.info(f"[ROLE+] {member} ← {role.name}")
+
+    # ── تل / removerole ────────────────────────────────────────────────────
+    elif cmd in ("تل", "removerole"):
+        if not _is_mod(author): return await _no_perm(message)
+        if len(rest) < 2: return await _usage(message, "تل @عضو @رول")
+        member = await _resolve_member(guild, rest[0])
+        role   = await _resolve_role(guild, rest[1])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        if not role:   return await message.reply("الرول غير موجود.", delete_after=4)
+        if role >= author.top_role and author != guild.owner:
+            return await message.reply("لا تستطيع سحب رول أعلى منك.", delete_after=4)
+        await member.remove_roles(role, reason=f"بواسطة {author}")
+        await message.channel.send(embed=_mod_embed("تم سحب الرول", discord.Color.orange(),
+                                                     العضو=str(member), الرول=role.mention, المشرف=str(author)), delete_after=8)
+        logger.info(f"[ROLE-] {member} ✗ {role.name}")
+
+    # ── ق / lock ───────────────────────────────────────────────────────────
+    elif cmd in ("ق", "lock"):
+        if not _is_mod(author): return await _no_perm(message)
+        reason = " ".join(rest) or "لا يوجد سبب"
+        ow = message.channel.overwrites_for(guild.default_role)
+        ow.send_messages = False
+        await message.channel.set_permissions(guild.default_role, overwrite=ow, reason=reason)
+        await message.channel.send(embed=_mod_embed("تم قفل الروم", discord.Color.red(),
+                                                     الروم=message.channel.mention, السبب=reason, المشرف=str(author)), delete_after=8)
+        logger.info(f"[LOCK] #{message.channel.name}")
+
+    # ── ف / unlock ─────────────────────────────────────────────────────────
+    elif cmd in ("ف", "unlock"):
+        if not _is_mod(author): return await _no_perm(message)
+        reason = " ".join(rest) or "لا يوجد سبب"
+        ow = message.channel.overwrites_for(guild.default_role)
+        ow.send_messages = None
+        await message.channel.set_permissions(guild.default_role, overwrite=ow, reason=reason)
+        await message.channel.send(embed=_mod_embed("تم فتح الروم", discord.Color.green(),
+                                                     الروم=message.channel.mention, السبب=reason, المشرف=str(author)), delete_after=8)
+        logger.info(f"[UNLOCK] #{message.channel.name}")
+
+    # ── warn ───────────────────────────────────────────────────────────────
+    elif cmd == "warn":
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "warn @عضو [سبب]")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        reason = " ".join(rest[1:]) or "لا يوجد سبب"
+        warns  = _load_warns()
+        warns.setdefault(str(member.id), []).append({
+            "reason": reason, "by": str(author), "at": str(datetime.now(timezone.utc))
+        })
+        _save_warns(warns)
+        count = len(warns[str(member.id)])
+        await _dm(member, _mod_embed("تلقيت تحذيراً", discord.Color.yellow(),
+                                      السيرفر=guild.name, السبب=reason,
+                                      المشرف=str(author), **{"إجمالي تحذيراتك": count}))
+        await message.channel.send(embed=_mod_embed("تم التحذير", discord.Color.yellow(),
+                                                     العضو=str(member), السبب=reason,
+                                                     **{"إجمالي التحذيرات": count}, المشرف=str(author)), delete_after=8)
+        logger.info(f"[WARN] {member} | #{count}")
+
+    # ── warns ──────────────────────────────────────────────────────────────
+    elif cmd == "warns":
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "warns @عضو")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        w = _load_warns().get(str(member.id), [])
+        if not w:
+            return await message.reply(f"{member.mention} ليس لديه تحذيرات.")
+        embed = discord.Embed(title=f"تحذيرات {member.display_name}",
+                              color=discord.Color.orange(), timestamp=datetime.now(timezone.utc))
+        for i, x in enumerate(w, 1):
+            embed.add_field(name=f"#{i}", value=f"السبب: {x['reason']}\nبواسطة: {x['by']}", inline=False)
+        await message.channel.send(embed=embed, delete_after=8)
+
+    # ── clearwarns ─────────────────────────────────────────────────────────
+    elif cmd == "clearwarns":
+        if not _is_mod(author): return await _no_perm(message)
+        if not rest: return await _usage(message, "clearwarns @عضو")
+        member = await _resolve_member(guild, rest[0])
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        warns = _load_warns()
+        warns.pop(str(member.id), None)
+        _save_warns(warns)
+        await message.channel.send(embed=_mod_embed("تم مسح التحذيرات", discord.Color.green(),
+                                                     العضو=str(member), المشرف=str(author)), delete_after=8)
+
+    # ── clear ──────────────────────────────────────────────────────────────
+    elif cmd == "clear":
+        if not _is_mod(author): return await _no_perm(message)
+        try:
+            amount = int(rest[0]) if rest else 10
+        except ValueError:
+            return await _usage(message, "clear [عدد]")
+        if amount < 1 or amount > 500:
+            return await message.reply("العدد بين 1 و 500.", delete_after=4)
+        deleted = await message.channel.purge(limit=amount)
+        msg = await message.channel.send(f"تم حذف {len(deleted)} رسالة.", delete_after=4)
+        logger.info(f"[CLEAR] {len(deleted)} في #{message.channel.name}")
+
+    # ── userinfo ───────────────────────────────────────────────────────────
+    elif cmd == "userinfo":
+        member = await _resolve_member(guild, rest[0]) if rest else author
+        if not member: return await message.reply("العضو غير موجود.", delete_after=4)
+        embed = discord.Embed(title=str(member), color=member.color, timestamp=datetime.now(timezone.utc))
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.add_field(name="ID",            value=member.id,                                        inline=True)
+        embed.add_field(name="الرتبة",        value=member.top_role.mention,                          inline=True)
+        embed.add_field(name="انضم للسيرفر", value=discord.utils.format_dt(member.joined_at, "D"),   inline=True)
+        embed.add_field(name="أنشأ الحساب",  value=discord.utils.format_dt(member.created_at, "D"),  inline=True)
+        embed.add_field(name="بوت؟",         value="نعم" if member.bot else "لا",                    inline=True)
+        embed.add_field(name="التحذيرات",    value=str(len(_load_warns().get(str(member.id), []))),   inline=True)
+        await message.channel.send(embed=embed, delete_after=8)
+
+    # ── serverinfo ─────────────────────────────────────────────────────────
+    elif cmd == "serverinfo":
+        g = guild
+        embed = discord.Embed(title=g.name, color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+        if g.icon:
+            embed.set_thumbnail(url=g.icon.url)
+        embed.add_field(name="ID",         value=g.id,                                         inline=True)
+        embed.add_field(name="الأعضاء",    value=g.member_count,                               inline=True)
+        embed.add_field(name="الرومات",    value=len(g.text_channels)+len(g.voice_channels),   inline=True)
+        embed.add_field(name="الرتب",      value=len(g.roles),                                 inline=True)
+        embed.add_field(name="أُنشئ في",   value=discord.utils.format_dt(g.created_at, "D"),   inline=True)
+        embed.add_field(name="الأونر",     value=g.owner.mention if g.owner else "—",          inline=True)
+        await message.channel.send(embed=embed, delete_after=8)
+
+    # ── help / مساعدة ──────────────────────────────────────────────────────
+    elif cmd in ("help", "مساعدة"):
+        embed = discord.Embed(title="أوامر البوت", color=discord.Color.blurple(),
+                              timestamp=datetime.now(timezone.utc))
+        embed.add_field(name="برا @عضو [سبب]",          value="باند عضو",                inline=False)
+        embed.add_field(name="unban [ID] [سبب]",         value="رفع الباند",              inline=False)
+        embed.add_field(name="طرد @عضو [سبب]",          value="طرد عضو",                 inline=False)
+        embed.add_field(name="اص @عضو [مدة] [سبب]",     value="إسكات (10m/2h/1d)",      inline=False)
+        embed.add_field(name="فك @عضو",                 value="رفع الإسكات",             inline=False)
+        embed.add_field(name="اسم @عضو [اسم]",          value="تغيير النك نيم",           inline=False)
+        embed.add_field(name="رول @عضو @رول",           value="إعطاء رول",               inline=False)
+        embed.add_field(name="تل @عضو @رول",            value="سحب رول",                 inline=False)
+        embed.add_field(name="ق [سبب]",                 value="قفل الروم",               inline=False)
+        embed.add_field(name="ف [سبب]",                 value="فتح الروم",               inline=False)
+        embed.add_field(name="warn @عضو [سبب]",         value="تحذير عضو",              inline=False)
+        embed.add_field(name="warns @عضو",              value="عرض التحذيرات",           inline=False)
+        embed.add_field(name="clearwarns @عضو",         value="مسح التحذيرات",           inline=False)
+        embed.add_field(name="clear [عدد]",             value="مسح رسائل",              inline=False)
+        embed.add_field(name="userinfo [@عضو]",         value="معلومات عضو",            inline=False)
+        embed.add_field(name="serverinfo",              value="معلومات السيرفر",         inline=False)
+        await message.channel.send(embed=embed, delete_after=8)
+
 
 # =============================================================================
-# HANDLER: معالجة الطلب
+# RUN
 # =============================================================================
-
-async def handle_room_request(message: discord.Message):
-    admin_channel = bot.get_channel(ADMIN_CHANNEL_ID)
-    if not admin_channel:
-        logger.error(f"[ERROR] روم الادارة غير موجود: {ADMIN_CHANNEL_ID}")
-        return
-
-    # ── تحليل الرسالة ─────────────────────────────────────────────────────
-    # السطر الأول: اسم الروم
-    # باقي الأسطر: الكلام / الوصف
-    lines = [l for l in (message.content or "").strip().splitlines() if l.strip()]
-    raw_name    = lines[0].strip() if lines else f"روم-{message.author.display_name}"
-    description = "\n".join(lines[1:]) if len(lines) > 1 else ""
-    room_name   = sanitize_channel_name(raw_name)
-
-    existing_channel = find_existing_channel(message.guild, room_name)
-    mode = "existing" if existing_channel else "new"
-
-    attachments_data = [
-        {
-            "filename":     att.filename,
-            "url":          att.url,
-            "proxy_url":    att.proxy_url,
-            "size":         att.size,
-            "type_label":   get_attachment_type_label(att),
-            "content_type": att.content_type or "",
-        }
-        for att in message.attachments
-    ]
-
-    if mode == "existing":
-        embed_title = "طلب اضافة محتوى لروم موجود"
-        embed_color = discord.Color.blue()
-        mode_label  = f"اضافة الى {existing_channel.mention}"
-    else:
-        embed_title = "طلب انشاء روم جديد"
-        embed_color = discord.Color.gold()
-        mode_label  = "انشاء روم جديد"
-
-    embed = discord.Embed(
-        title=embed_title,
-        color=embed_color,
-        timestamp=message.created_at,
-    )
-    embed.set_author(
-        name=message.author.display_name,
-        icon_url=message.author.display_avatar.url,
-    )
-    embed.add_field(name="العضو",       value=message.author.mention,                           inline=True)
-    embed.add_field(name="الروم",       value=f"`{room_name}`",                                 inline=True)
-    embed.add_field(name="الحالة",      value="بانتظار المراجعة",                               inline=True)
-    embed.add_field(name="النوع",       value=mode_label,                                       inline=False)
-    embed.add_field(name="وقت الارسال", value=discord.utils.format_dt(message.created_at, "F"), inline=False)
-    embed.add_field(
-        name="الكلام",
-        value=(description or message.content or "_لا يوجد نص_")[:1024],
-        inline=False,
-    )
-    embed.add_field(name="المرفقات", value=build_attachment_summary(attachments_data), inline=True)
-    embed.add_field(name="العدد",    value=str(len(attachments_data)),                 inline=True)
-    embed.set_footer(text=f"Message ID: {message.id} - {message.guild.name}")
-
-    view      = ApprovalView()
-    admin_msg = await admin_channel.send(embed=embed, view=view)
-
-    view.admin_msg_id = admin_msg.id
-    pending_requests[admin_msg.id] = {
-        "member_id":           message.author.id,
-        "member_name":         message.author.display_name,
-        "room_name":           room_name,
-        "description":         description,
-        "text":                message.content or "",
-        "attachments":         attachments_data,
-        "mode":                mode,
-        "existing_channel_id": existing_channel.id if existing_channel else None,
-    }
-    _save_pending()
-
-    logger.info(
-        f"[REQUEST] من {message.author} | روم: {room_name} | "
-        f"وضع: {mode} | مرفقات: {len(attachments_data)}"
-    )
-
-    if attachments_data:
-        await admin_channel.send(
-            f"معاينة المرفقات ({len(attachments_data)}) - {room_name}"
-        )
-        for att in message.attachments:
-            try:
-                file  = await att.to_file(use_cached=True)
-                label = get_attachment_type_label(att)
-                await admin_channel.send(content=f"{label} - `{att.filename}`", file=file)
-            except Exception as exc:
-                logger.warning(f"[PREVIEW] تعذّر ارسال {att.filename}: {exc}")
-                await admin_channel.send(
-                    f"تعذّر معاينة `{att.filename}` - [رابط مباشر]({att.url})"
-                )
-
-    try:
-        await message.delete()
-        logger.info(f"[DELETE] تم حذف رسالة الطلب {message.id} من روم الطلبات")
-    except Exception as exc:
-        logger.warning(f"[DELETE] تعذّر حذف الرسالة {message.id}: {exc}")
-
-# =============================================================================
-# COMMANDS
-# =============================================================================
-
-@bot.command(name="ping")
-async def cmd_ping(ctx: commands.Context):
-    await ctx.send(f"Pong! `{round(bot.latency * 1000)}ms`")
-
-
-@bot.command(name="status")
-@commands.has_permissions(administrator=True)
-async def cmd_status(ctx: commands.Context):
-    embed = discord.Embed(title="حالة البوت", color=discord.Color.blurple())
-    embed.add_field(name="طلبات معلقة",   value=str(len(pending_requests)),    inline=True)
-    embed.add_field(name="رسائل معالجة",  value=str(len(processed_messages)),  inline=True)
-    embed.add_field(name="Latency",        value=f"{round(bot.latency*1000)}ms", inline=True)
-    embed.add_field(name="روم الادارة",   value=f"<#{ADMIN_CHANNEL_ID}>",      inline=True)
-    embed.add_field(name="روم الطلبات",   value=f"<#{REQUEST_CHANNEL_ID}>",    inline=True)
-    await ctx.send(embed=embed)
-
-
-@bot.command(name="clear_pending")
-@commands.has_permissions(administrator=True)
-async def cmd_clear_pending(ctx: commands.Context):
-    count = len(pending_requests)
-    pending_requests.clear()
-    await ctx.send(f"تم مسح `{count}` طلب معلق من الذاكرة.")
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
-def main():
-    if not TOKEN:
-        logger.critical("DISCORD_TOKEN غير محدد!")
-        raise SystemExit(1)
-    if not ADMIN_CHANNEL_ID:
-        logger.critical("ADMIN_CHANNEL_ID غير محدد!")
-        raise SystemExit(1)
-    if not REQUEST_CHANNEL_ID:
-        logger.critical("REQUEST_CHANNEL_ID غير محدد!")
-        raise SystemExit(1)
-
+if not TOKEN:
+    logger.critical("DISCORD_TOKEN غير موجود!")
+else:
     logger.info("تشغيل البوت...")
-    bot.run(TOKEN, log_handler=None)
-
-
-if __name__ == "__main__":
-    main()
+    bot.run(TOKEN)
